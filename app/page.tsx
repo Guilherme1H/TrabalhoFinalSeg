@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useMemo } from "react";
 import { auth, db } from "../lib/firebase";
 import {
   collection,
@@ -10,106 +10,87 @@ import {
   onSnapshot,
   deleteDoc,
   doc,
+  updateDoc,
+  setDoc,
+  getDoc,
 } from "firebase/firestore";
-import {
-  onAuthStateChanged,
-  signInWithPopup,
-  GoogleAuthProvider,
-  signOut,
-} from "firebase/auth";
-import {
-  LineChart,
-  Line,
-  XAxis,
-  YAxis,
-  CartesianGrid,
-  Tooltip,
-  ResponsiveContainer,
-  BarChart,
-  Bar,
-  ReferenceLine,
-} from "recharts";
+import { onAuthStateChanged, signOut } from "firebase/auth";
 import {
   PlusCircle,
-  Clock,
   Utensils,
-  TrendingUp,
-  AlertCircle,
   Trash2,
   Calendar,
-  Settings,
   LogOut,
-  Download,
-  LogIn,
+  Edit2,
+  AlertCircle,
+  Loader2,
 } from "lucide-react";
+import { z } from "zod";
+
+import LoginScreen from "./login";
+import StatsCards from "./components/StatsCards";
+import MainChart from "./components/MainChart";
+
+const mealSchema = z.object({
+  description: z.string().min(2, "Descrição muito curta"),
+  calories: z.number().min(1, "Mínimo 1 kcal"),
+  date: z.string(),
+  time: z.string(),
+  type: z.enum(["Café", "Almoço", "Lanche", "Jantar", "Ceia"]),
+});
 
 export default function FitTrackApp() {
   const [mounted, setMounted] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [user, setUser] = useState<any>(null);
   const [meals, setMeals] = useState<any[]>([]);
+  const [fasts, setFasts] = useState<any[]>([]);
+  const [activeFast, setActiveFast] = useState<any>(null);
   const [dailyGoal, setDailyGoal] = useState(2000);
   const [showMealModal, setShowMealModal] = useState(false);
+  const [editingMeal, setEditingMeal] = useState<any>(null);
   const [showGoalModal, setShowGoalModal] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const [filterDate, setFilterDate] = useState(
     new Date().toISOString().split("T")[0]
   );
 
   useEffect(() => {
     setMounted(true);
-    const unsubAuth = onAuthStateChanged(auth, (u) => {
+    const unsubAuth = onAuthStateChanged(auth, async (u) => {
       setUser(u);
       if (u) {
-        const qMeals = query(
-          collection(db, "meals"),
-          where("userId", "==", u.uid)
-        );
-        const unsubMeals = onSnapshot(qMeals, (snap) => {
-          setMeals(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
-        });
-        return () => unsubMeals();
+        try {
+          const goalSnap = await getDoc(doc(db, "userSettings", u.uid));
+          if (goalSnap.exists()) setDailyGoal(goalSnap.data().dailyGoal);
+
+          const qMeals = query(
+            collection(db, "meals"),
+            where("userId", "==", u.uid)
+          );
+          onSnapshot(qMeals, (snap) =>
+            setMeals(snap.docs.map((d) => ({ id: d.id, ...d.data() })))
+          );
+
+          const qFasts = query(
+            collection(db, "fasts"),
+            where("userId", "==", u.uid)
+          );
+          onSnapshot(qFasts, (snap) => {
+            const allFasts = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+            setFasts(allFasts);
+            setActiveFast(allFasts.find((f: any) => !f.endTime) || null);
+          });
+        } catch (e) {
+          setError("Erro de conexão com o Firebase.");
+        }
       }
+      setLoading(false);
     });
     return () => unsubAuth();
   }, []);
 
-  if (!mounted) return null;
-
-  const handleLogin = () => signInWithPopup(auth, new GoogleAuthProvider());
-  const handleLogout = () => signOut(auth);
-
-  const exportData = () => {
-    const data = JSON.stringify({ meals, dailyGoal }, null, 2);
-    const blob = new Blob([data], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `fit-track-data.json`;
-    link.click();
-  };
-
-  const addMeal = async (e: React.FormEvent<HTMLFormElement>) => {
-    e.preventDefault();
-    const fd = new FormData(e.currentTarget);
-    await addDoc(collection(db, "meals"), {
-      userId: user.uid,
-      date: `${fd.get("date")}T${fd.get("time")}`,
-      description: fd.get("description"),
-      calories: Number(fd.get("calories")),
-      type: fd.get("type"),
-    });
-    setShowMealModal(false);
-  };
-
-  const deleteMeal = async (id: string) => {
-    if (confirm("Deseja excluir este registro?")) {
-      await deleteDoc(doc(db, "meals", id));
-    }
-  };
-
-  const filteredMeals = meals.filter((m) => m.date.startsWith(filterDate));
-  const totalCalsOnDate = filteredMeals.reduce((acc, m) => acc + m.calories, 0);
-
-  const getChartData = () => {
+  const chartData = useMemo(() => {
     return [...Array(7)].map((_, i) => {
       const d = new Date();
       d.setDate(d.getDate() - (6 - i));
@@ -118,277 +99,233 @@ export default function FitTrackApp() {
         day: d.toLocaleDateString("pt-BR", { weekday: "short" }),
         fullDate: ds,
         cals: meals
-          .filter((m) => m.date.startsWith(ds))
+          .filter((m) => m.date?.startsWith(ds))
           .reduce((acc, m) => acc + m.calories, 0),
+        fastHours: fasts
+          .filter((f) => f.endTime?.startsWith(ds))
+          .reduce((acc, f) => acc + Number(f.duration), 0),
       };
+    });
+  }, [meals, fasts]);
+
+  const filteredMeals = meals.filter((m) => m.date?.startsWith(filterDate));
+  const totalCals = filteredMeals.reduce((acc, m) => acc + m.calories, 0);
+
+  if (!mounted || loading)
+    return (
+      <div className="h-screen flex items-center justify-center">
+        <Loader2 className="animate-spin text-indigo-600" size={40} />
+      </div>
+    );
+  if (!user) return <LoginScreen />;
+
+  const handleSubmitMeal = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    setError(null);
+    const fd = new FormData(e.currentTarget);
+    const raw = {
+      description: fd.get("description") as string,
+      calories: Number(fd.get("calories")),
+      date: fd.get("date") as string,
+      time: fd.get("time") as string,
+      type: fd.get("type") as any,
+    };
+
+    const result = mealSchema.safeParse(raw);
+    if (!result.success) return setError(result.error.issues[0].message);
+
+    const finalData = {
+      ...result.data,
+      userId: user.uid,
+      date: `${result.data.date}T${result.data.time}`,
+    };
+    editingMeal
+      ? await updateDoc(doc(db, "meals", editingMeal.id), finalData)
+      : await addDoc(collection(db, "meals"), finalData);
+    setShowMealModal(false);
+    setEditingMeal(null);
+  };
+
+  const startFast = async (type: string) => {
+    await addDoc(collection(db, "fasts"), {
+      userId: user.uid,
+      startTime: new Date().toISOString(),
+      plannedType: type,
+      endTime: null,
     });
   };
 
-  if (!user)
-    return (
-      <div className="h-screen flex flex-col items-center justify-center bg-slate-50 text-slate-900">
-        <div className="w-20 h-20 bg-indigo-600 rounded-3xl mb-8 flex items-center justify-center text-white text-4xl font-black">
-          G
-        </div>
-        <h1 className="text-3xl font-black mb-2 tracking-tighter">
-          FitTrack TSI
-        </h1>
-        <button
-          onClick={handleLogin}
-          className="flex items-center gap-3 bg-white border-2 border-slate-200 px-10 py-4 rounded-2xl font-black hover:bg-slate-50 transition shadow-sm"
-        >
-          <LogIn size={20} /> Entrar com Google
-        </button>
-      </div>
+  const endFast = async () => {
+    const end = new Date();
+    const duration = (
+      (end.getTime() - new Date(activeFast.startTime).getTime()) /
+      (1000 * 3600)
+    ).toFixed(2);
+    await updateDoc(doc(db, "fasts", activeFast.id), {
+      endTime: end.toISOString(),
+      duration,
+    });
+  };
+
+  const saveGoal = async () => {
+    await setDoc(
+      doc(db, "userSettings", user.uid),
+      { dailyGoal },
+      { merge: true }
     );
+    setShowGoalModal(false);
+  };
 
   return (
-    <div className="max-w-6xl mx-auto p-4 md:p-8 text-slate-900">
-      <header className="flex flex-col md:flex-row justify-between items-center mb-8 bg-white p-6 rounded-3xl shadow-sm border border-slate-100 gap-4">
-        <div className="flex items-center gap-4 w-full md:w-auto">
-          <img src={user.photoURL} className="w-12 h-12 rounded-2xl" />
-          <div>
-            <h1 className="text-xl font-black">{user.displayName}</h1>
-            <p className="text-[10px] font-black text-slate-400 uppercase">
-              TSI Senac • Dashboard
-            </p>
+    <div className="max-w-6xl mx-auto p-4 md:p-8 bg-slate-50 min-h-screen">
+      <header className="flex justify-between items-center mb-8 bg-white p-6 rounded-3xl shadow-sm">
+        <div className="flex items-center gap-4">
+          <div className="w-10 h-10 bg-indigo-600 rounded-xl flex items-center justify-center text-white font-black">
+            G
           </div>
+          <h1 className="font-black text-slate-800 hidden sm:block">
+            FITTRACK TSI
+          </h1>
         </div>
-        <div className="flex items-center gap-2 w-full md:w-auto justify-end">
+        <div className="flex items-center gap-3">
+          <input
+            type="date"
+            value={filterDate}
+            onChange={(e) => setFilterDate(e.target.value)}
+            className="text-xs font-bold p-2 bg-slate-100 rounded-lg outline-none"
+          />
           <button
-            onClick={exportData}
-            className="p-3 text-slate-300 hover:text-indigo-600 transition"
-          >
-            <Download size={20} />
-          </button>
-          <button
-            onClick={handleLogout}
-            className="p-3 text-slate-300 hover:text-rose-500 transition"
+            onClick={() => signOut(auth)}
+            className="text-slate-300 hover:text-rose-500"
           >
             <LogOut size={20} />
           </button>
-          <div className="flex items-center gap-2 bg-slate-50 p-2 rounded-2xl border border-slate-100 ml-2">
-            <Calendar size={18} className="text-indigo-500 ml-2" />
-            <input
-              type="date"
-              value={filterDate}
-              onChange={(e) => setFilterDate(e.target.value)}
-              className="bg-transparent border-none outline-none text-sm font-black text-slate-700 p-1"
-            />
-          </div>
         </div>
       </header>
 
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
-        <div className="bg-white p-6 rounded-[2.5rem] border border-slate-100 shadow-sm">
-          <div className="flex justify-between items-center mb-4">
-            <Utensils className="text-indigo-500" size={24} />
-            <button
-              onClick={() => setShowGoalModal(true)}
-              className="text-slate-300 hover:text-indigo-500 transition"
-            >
-              <Settings size={18} />
-            </button>
-          </div>
-          <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest">
-            Calorias Hoje
-          </p>
-          <h2 className="text-4xl font-black my-1">
-            {totalCalsOnDate}{" "}
-            <span className="text-sm font-bold text-slate-300">
-              / {dailyGoal}
-            </span>
-          </h2>
-          <div className="h-2 w-full bg-slate-100 rounded-full mt-3 overflow-hidden">
-            <div
-              className={`h-full transition-all duration-1000 ${
-                totalCalsOnDate > dailyGoal ? "bg-rose-500" : "bg-indigo-500"
-              }`}
-              style={{
-                width: `${Math.min((totalCalsOnDate / dailyGoal) * 100, 100)}%`,
-              }}
-            />
-          </div>
+      <StatsCards
+        totalCals={totalCals}
+        dailyGoal={dailyGoal}
+        chartData={chartData}
+        activeFast={activeFast}
+        onOpenGoal={() => setShowGoalModal(true)}
+        onStartFast={startFast}
+        onEndFast={endFast}
+      />
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+        <div className="lg:col-span-2">
+          <MainChart data={chartData} dailyGoal={dailyGoal} />
         </div>
 
-        <div className="bg-white p-6 rounded-[2.5rem] border border-slate-100 shadow-sm">
-          <Clock className="text-emerald-500 mb-4" size={24} />
-          <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest">
-            Jejum
-          </p>
-          <div className="grid grid-cols-2 gap-2 mt-2">
-            {["16:8", "18:6", "20:4", "24h"].map((t) => (
-              <button
-                key={t}
-                className="py-2 bg-slate-50 text-slate-500 font-bold rounded-xl hover:bg-slate-200 transition text-[10px] uppercase"
-              >
-                {t}
-              </button>
-            ))}
-          </div>
-        </div>
-
-        <div className="bg-white p-6 rounded-[2.5rem] border border-slate-100 shadow-sm">
-          <TrendingUp className="text-amber-500 mb-4" size={24} />
-          <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest">
-            Atividade Semanal
-          </p>
-          <div className="h-16 w-full mt-2">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={getChartData()}>
-                <Bar
-                  dataKey="cals"
-                  fill="#e2e8f0"
-                  radius={[4, 4, 0, 0]}
-                  onClick={(d: any) => setFilterDate(d.fullDate)}
-                />
-              </BarChart>
-            </ResponsiveContainer>
-          </div>
-        </div>
-      </div>
-
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        <div className="lg:col-span-2 bg-white p-8 rounded-[3rem] border border-slate-100 shadow-sm">
-          <div className="flex justify-between items-center mb-10">
-            <h3 className="font-black uppercase tracking-[0.2em] text-xs">
-              Progresso
+        <div className="bg-white p-8 rounded-[3rem] border border-slate-100 shadow-sm">
+          <div className="flex justify-between items-center mb-6">
+            <h3 className="font-black uppercase text-[10px] tracking-widest text-slate-400">
+              Refeições
             </h3>
             <button
-              onClick={() => setShowMealModal(true)}
-              className="flex items-center gap-2 bg-indigo-600 text-white px-6 py-3 rounded-2xl font-bold text-sm hover:bg-indigo-700 shadow-xl transition shadow-indigo-100"
+              onClick={() => {
+                setEditingMeal(null);
+                setShowMealModal(true);
+              }}
+              className="text-indigo-600 font-black text-[10px]"
             >
-              <PlusCircle size={18} /> Novo Registro
+              + ADD
             </button>
           </div>
-          <div className="h-[300px]">
-            <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={getChartData()}>
-                <CartesianGrid
-                  strokeDasharray="3 3"
-                  vertical={false}
-                  stroke="#f1f5f9"
-                />
-                <XAxis
-                  dataKey="day"
-                  axisLine={false}
-                  tickLine={false}
-                  tick={{ fill: "#94a3b8", fontSize: 12, fontWeight: "bold" }}
-                  dy={10}
-                />
-                <YAxis hide domain={[0, "auto"]} />
-                <Tooltip
-                  contentStyle={{
-                    borderRadius: "20px",
-                    border: "none",
-                    boxShadow: "0 20px 25px -5px rgba(0,0,0,0.1)",
-                  }}
-                />
-                <ReferenceLine
-                  y={dailyGoal}
-                  stroke="#f97316"
-                  strokeDasharray="5 5"
-                />
-                <Line
-                  type="monotone"
-                  dataKey="cals"
-                  stroke="#4f46e5"
-                  strokeWidth={5}
-                  dot={{
-                    r: 6,
-                    fill: "#4f46e5",
-                    stroke: "#fff",
-                    strokeWidth: 3,
-                  }}
-                  activeDot={{ r: 8 }}
-                />
-              </LineChart>
-            </ResponsiveContainer>
-          </div>
-        </div>
-
-        <div className="bg-white p-8 rounded-[3rem] border border-slate-100 shadow-sm flex flex-col">
-          <h3 className="font-black uppercase tracking-[0.2em] text-xs mb-8">
-            Refeições de Hoje
-          </h3>
-          <div className="space-y-4 overflow-y-auto max-h-[350px] flex-1">
-            {filteredMeals.length === 0 && (
-              <p className="text-center py-20 text-slate-300 font-black uppercase text-[10px] italic">
-                Vazio
-              </p>
-            )}
+          <div className="space-y-3">
             {filteredMeals.map((m) => (
               <div
                 key={m.id}
-                className="group flex justify-between items-center p-4 bg-slate-50 rounded-2xl hover:border-slate-200 border border-transparent transition"
+                className="flex justify-between items-center p-4 bg-slate-50 rounded-2xl group border border-transparent hover:border-indigo-100"
               >
                 <div>
                   <p className="font-bold text-sm">{m.description}</p>
-                  <p className="text-[10px] font-black text-slate-400 uppercase tracking-tighter">
+                  <p className="text-[10px] font-black text-slate-400 uppercase">
                     {m.type} • {m.calories} kcal
                   </p>
                 </div>
-                <button
-                  onClick={() => deleteMeal(m.id)}
-                  className="text-slate-300 hover:text-rose-500 opacity-0 group-hover:opacity-100 transition"
-                >
-                  <Trash2 size={16} />
-                </button>
+                <div className="flex gap-2 opacity-0 group-hover:opacity-100 transition">
+                  <button
+                    onClick={() => {
+                      setEditingMeal(m);
+                      setShowMealModal(true);
+                    }}
+                    className="text-indigo-600"
+                  >
+                    <Edit2 size={14} />
+                  </button>
+                  <button
+                    onClick={() => {
+                      if (confirm("Excluir?"))
+                        deleteDoc(doc(db, "meals", m.id));
+                    }}
+                    className="text-rose-500"
+                  >
+                    <Trash2 size={14} />
+                  </button>
+                </div>
               </div>
             ))}
           </div>
         </div>
       </div>
 
-      <footer className="mt-12 p-8 bg-slate-900 rounded-[2.5rem] text-slate-500 flex flex-col md:flex-row gap-6 items-center">
-        <AlertCircle className="text-indigo-500 shrink-0" size={32} />
-        <p className="text-[10px] font-black uppercase tracking-[0.2em] leading-relaxed">
-          Este software é um protótipo acadêmico (TSI Senac). Não substitui
-          orientação médica ou nutricional.
-        </p>
-      </footer>
-
       {showMealModal && (
         <div className="fixed inset-0 bg-slate-900/80 backdrop-blur-md flex items-center justify-center p-4 z-50">
           <form
-            onSubmit={addMeal}
+            onSubmit={handleSubmitMeal}
             className="bg-white p-10 rounded-[3rem] w-full max-w-md shadow-2xl"
           >
-            <h2 className="text-2xl font-black mb-8 uppercase tracking-tighter">
-              Novo Registro
+            <h2 className="text-2xl font-black mb-6 uppercase italic text-slate-800">
+              {editingMeal ? "Editar" : "Novo Registro"}
             </h2>
+            {error && (
+              <div className="mb-4 text-rose-500 text-[10px] font-black flex items-center gap-2">
+                <AlertCircle size={14} /> {error}
+              </div>
+            )}
             <div className="space-y-4">
               <div className="grid grid-cols-2 gap-4">
                 <input
                   name="date"
                   type="date"
-                  defaultValue={filterDate}
-                  className="w-full p-4 bg-slate-50 rounded-2xl outline-none font-bold text-sm"
+                  required
+                  defaultValue={
+                    editingMeal ? editingMeal.date.split("T")[0] : filterDate
+                  }
+                  className="w-full p-4 bg-slate-50 rounded-2xl outline-none font-bold text-xs"
                 />
                 <input
                   name="time"
                   type="time"
-                  defaultValue="12:00"
-                  className="w-full p-4 bg-slate-50 rounded-2xl outline-none font-bold text-sm"
+                  required
+                  defaultValue={
+                    editingMeal ? editingMeal.date.split("T")[1] : "12:00"
+                  }
+                  className="w-full p-4 bg-slate-50 rounded-2xl outline-none font-bold text-xs"
                 />
               </div>
               <input
                 name="description"
-                required
                 placeholder="O que comeu?"
-                className="w-full p-4 bg-slate-50 rounded-2xl outline-none font-bold"
+                required
+                defaultValue={editingMeal?.description}
+                className="w-full p-4 bg-slate-50 rounded-2xl outline-none font-bold text-xs"
               />
               <div className="grid grid-cols-2 gap-4">
                 <input
                   name="calories"
                   type="number"
-                  required
                   placeholder="Kcal"
-                  className="w-full p-4 bg-slate-50 rounded-2xl outline-none font-bold"
+                  required
+                  defaultValue={editingMeal?.calories}
+                  className="w-full p-4 bg-slate-50 rounded-2xl outline-none font-bold text-xs"
                 />
                 <select
                   name="type"
-                  className="w-full p-4 bg-slate-50 rounded-2xl outline-none font-bold text-xs uppercase tracking-widest"
+                  defaultValue={editingMeal?.type || "Almoço"}
+                  className="w-full p-4 bg-slate-50 rounded-2xl outline-none font-bold text-[10px] uppercase"
                 >
                   <option>Café</option>
                   <option>Almoço</option>
@@ -402,13 +339,13 @@ export default function FitTrackApp() {
               <button
                 type="button"
                 onClick={() => setShowMealModal(false)}
-                className="flex-1 font-black text-slate-400 text-xs uppercase"
+                className="flex-1 font-black text-slate-400 text-[10px] uppercase"
               >
-                Voltar
+                Sair
               </button>
               <button
                 type="submit"
-                className="flex-1 py-4 bg-indigo-600 text-white rounded-2xl font-black text-xs uppercase shadow-lg shadow-indigo-100"
+                className="flex-1 py-4 bg-indigo-600 text-white rounded-2xl font-black text-[10px] uppercase shadow-xl shadow-indigo-100"
               >
                 Salvar
               </button>
@@ -419,21 +356,21 @@ export default function FitTrackApp() {
 
       {showGoalModal && (
         <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-md flex items-center justify-center p-4 z-50">
-          <div className="bg-white p-10 rounded-[3rem] w-full max-w-sm shadow-2xl">
-            <h2 className="text-xl font-black mb-4 uppercase text-center tracking-tighter">
-              Meta Diária
+          <div className="bg-white p-10 rounded-[3rem] w-full max-w-sm shadow-2xl text-center">
+            <h2 className="text-xl font-black mb-4 uppercase italic">
+              META DIÁRIA
             </h2>
             <input
               type="number"
               value={dailyGoal}
               onChange={(e) => setDailyGoal(Number(e.target.value))}
-              className="w-full p-5 bg-slate-50 rounded-3xl outline-none font-black text-center text-3xl text-indigo-600"
+              className="w-full p-5 bg-slate-50 rounded-3xl outline-none font-black text-center text-3xl text-indigo-600 mb-6"
             />
             <button
-              onClick={() => setShowGoalModal(false)}
-              className="w-full mt-6 py-4 bg-slate-900 text-white rounded-2xl font-black text-xs uppercase tracking-widest"
+              onClick={saveGoal}
+              className="w-full py-4 bg-slate-900 text-white rounded-2xl font-black text-[10px] uppercase"
             >
-              Confirmar
+              Confirmar e Salvar
             </button>
           </div>
         </div>
